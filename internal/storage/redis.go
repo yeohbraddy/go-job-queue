@@ -111,7 +111,7 @@ func (s *RedisStorage) UpdateJob(ctx context.Context, j *job.Job) error {
 	currentJob, err := s.GetJob(ctx, j.ID)
 	if err != nil {
 		if err == redis.Nil {
-			return nil, nil
+			return fmt.Errorf("job %s not found", j.ID)
 		}
 		return fmt.Errorf("failed to get job: %w", err)
 	}
@@ -217,40 +217,99 @@ func (s *RedisStorage) ListJobs(ctx context.Context, status job.Status, limit, o
 	if status != "" {
 		// a. Get jobs by status:
 		//    i. Generate the status set key using `s.jobsSetFunc(status)`.
+		statusSetKey := s.jobsSetFunc(status)
+
 		//    ii. Use `s.client.SMembers` to get all members (job IDs) from the set. Handle errors.
+		jobIds, err := s.client.SMembers(ctx, statusSetKey).Result()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get job IDs: %w", err)
+		}
+
 		//    iii. Assign the result to `jobIDs`.
+		jobIDs = jobIds
 	} else {
 		// b. Get all jobs sorted by time (use ZRevRange for newest first):
 		//    i. Use `s.client.ZRevRange` on `s.jobsKey`. The range is `[offset, offset+limit-1]`. Handle errors.
+		jobIds, err := s.client.ZRevRange(ctx, s.jobsKey, int64(offset), int64(offset+limit-1)).Result()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get job IDs: %w", err)
+		}
+
 		//    ii. Assign the resulting slice of IDs to `jobIDs`.
+		jobIDs = jobIds
 	}
 
 	// 2. If we retrieved by status (in step 1a), we need to manually apply limit and offset to the `jobIDs` slice.
-	//    - Check bounds (`offset >= len(jobIDs)`).
-	//    - Calculate `end` index, ensuring it doesn't exceed `len(jobIDs)`.
-	//    - Slice `jobIDs` appropriately: `jobIDs = jobIDs[offset:end]`. Handle the case where `offset >= end`.
-	//    (Note: If we retrieved using ZRevRange in step 1b, Redis already handled limit/offset).
+	if status != "" {
+		//    - Check bounds (`offset >= len(jobIDs)`).
+		//    - Calculate `end` index, ensuring it doesn't exceed `len(jobIDs)`.
+		//    - Slice `jobIDs` appropriately: `jobIDs = jobIDs[offset:end]`. Handle the case where `offset >= end`.
+		//    (Note: If we retrieved using ZRevRange in step 1b, Redis already handled limit/offset).
+		end := offset + limit
+		if offset >= len(jobIDs) {
+			jobIDs = nil
+		} else if end > len(jobIDs) {
+			end = len(jobIDs)
+		}
+		jobIDs = jobIDs[offset:end]
+	}
 
 	// 3. If `jobIDs` is empty after filtering/fetching, return an empty slice `[]*job.Job{}` and nil error.
+	if len(jobIDs) == 0 {
+		return nil, nil
+	}
 
 	// 4. Fetch the actual job data for the filtered `jobIDs`:
 	//    a. Create an empty slice `result := []*job.Job{}`.
+	result := []*job.Job{}
+
 	//    b. Start a Redis pipeline: `pipe := s.client.Pipeline()`.
+	pipe := s.client.Pipeline()
+
 	//    c. Create a map to store the pipeline commands: `cmds := make(map[string]*redis.StringCmd)`.
+	cmds := make(map[string]*redis.StringCmd)
+
 	//    d. Loop through `jobIDs`:
 	//       i. Generate the job key using `s.jobKeyFunc(id)`.
 	//       ii. Add a `pipe.Get(ctx, jobKey)` command to the pipeline and store the resulting command object in the map: `cmds[id] = pipe.Get(...)`.
+	for _, id := range jobIDs {
+		jobKey := s.jobKeyFunc(id)
+		cmds[id] = pipe.Get(ctx, jobKey)
+	}
+
 	//    e. Execute the pipeline: `pipe.Exec(ctx)`. Handle errors (ignore `redis.Nil` for individual gets, but handle other pipeline errors).
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute pipeline: %w", err)
+	}
+
 	//    f. Loop through the `cmds` map (or iterate through `jobIDs` again and look up in `cmds`):
-	//       i. Get the result bytes for the command: `cmd.Bytes()`.
-	//       ii. If there's no error getting the bytes:
-	//          - Create a `job.Job` variable.
-	//          - Unmarshal the bytes into the job variable. Handle errors (`fmt.Errorf`).
-	//          - Append the pointer to the job variable (`&j`) to the `result` slice.
-	//       iii. (Handle potential errors where a job existed in the list/set but was deleted before the `Get` executed - `cmd.Err() == redis.Nil`).
+	for _, id := range jobIDs {
+		cmd := cmds[id]
+		//       i. Get the result bytes for the command: `cmd.Bytes()`.
+		bytes, err := cmd.Bytes()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get job bytes: %w", err)
+		}
+
+		//       ii. If there's no error getting the bytes:
+		//          - Create a `job.Job` variable.
+		//          - Unmarshal the bytes into the job variable. Handle errors (`fmt.Errorf`).
+		//          - Append the pointer to the job variable (`&j`) to the `result` slice.
+
+		var j job.Job
+		err = json.Unmarshal(bytes, &j)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal job: %w", err)
+		}
+		result = append(result, &j)
+		//       iii. (Handle potential errors where a job existed in the list/set but was deleted before the `Get` executed - `cmd.Err() == redis.Nil`).
+		if cmd.Err() == redis.Nil {
+			return nil, fmt.Errorf("job %s not found", id)
+		}
+	}
 
 	// 5. Return the `result` slice and nil error.
+	return result, nil
 
-	// --- Your implementation here ---
-	return nil, fmt.Errorf("ListJobs not implemented")
 }
