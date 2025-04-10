@@ -110,10 +110,10 @@ func (s *RedisStorage) UpdateJob(ctx context.Context, j *job.Job) error {
 	// 1. Get the current state of the job using `s.GetJob(ctx, j.ID)`. Handle errors (including not found).
 	currentJob, err := s.GetJob(ctx, j.ID)
 	if err != nil {
-		if err == redis.Nil {
-			return fmt.Errorf("job %s not found", j.ID)
-		}
 		return fmt.Errorf("failed to get job: %w", err)
+	}
+	if currentJob == nil {
+		return fmt.Errorf("job %s not found", j.ID)
 	}
 
 	// 2. Check if the status has changed (`currentJob.Status != j.Status`).
@@ -169,9 +169,6 @@ func (s *RedisStorage) DeleteJob(ctx context.Context, id string) error {
 	// 1. Get the current job using `s.GetJob(ctx, id)` to know its status.
 	currentJob, err := s.GetJob(ctx, id)
 	if err != nil {
-		if err == redis.Nil {
-			return nil
-		}
 		return fmt.Errorf("failed to get job: %w", err)
 	}
 
@@ -250,13 +247,15 @@ func (s *RedisStorage) ListJobs(ctx context.Context, status job.Status, limit, o
 			jobIDs = nil
 		} else if end > len(jobIDs) {
 			end = len(jobIDs)
+			jobIDs = jobIDs[offset:end]
+		} else {
+			jobIDs = jobIDs[offset:end]
 		}
-		jobIDs = jobIDs[offset:end]
 	}
 
 	// 3. If `jobIDs` is empty after filtering/fetching, return an empty slice `[]*job.Job{}` and nil error.
 	if len(jobIDs) == 0 {
-		return nil, nil
+		return []*job.Job{}, nil
 	}
 
 	// 4. Fetch the actual job data for the filtered `jobIDs`:
@@ -279,37 +278,40 @@ func (s *RedisStorage) ListJobs(ctx context.Context, status job.Status, limit, o
 
 	//    e. Execute the pipeline: `pipe.Exec(ctx)`. Handle errors (ignore `redis.Nil` for individual gets, but handle other pipeline errors).
 	_, err = pipe.Exec(ctx)
-	if err != nil {
+	if err != nil && err != redis.Nil {
 		return nil, fmt.Errorf("failed to execute pipeline: %w", err)
 	}
 
 	//    f. Loop through the `cmds` map (or iterate through `jobIDs` again and look up in `cmds`):
 	for _, id := range jobIDs {
 		cmd := cmds[id]
+
+		// First check if the job was deleted after we got its ID
+		if cmd.Err() == redis.Nil {
+			// Job was deleted after we got the list, just skip it
+			continue
+		}
+
 		//       i. Get the result bytes for the command: `cmd.Bytes()`.
 		bytes, err := cmd.Bytes()
 		if err != nil {
-			return nil, fmt.Errorf("failed to get job bytes: %w", err)
+			// Skip this job if there was an error getting the bytes
+			continue
 		}
 
 		//       ii. If there's no error getting the bytes:
 		//          - Create a `job.Job` variable.
 		//          - Unmarshal the bytes into the job variable. Handle errors (`fmt.Errorf`).
 		//          - Append the pointer to the job variable (`&j`) to the `result` slice.
-
 		var j job.Job
 		err = json.Unmarshal(bytes, &j)
 		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal job: %w", err)
+			// Skip this job if there was an error unmarshaling
+			continue
 		}
 		result = append(result, &j)
-		//       iii. (Handle potential errors where a job existed in the list/set but was deleted before the `Get` executed - `cmd.Err() == redis.Nil`).
-		if cmd.Err() == redis.Nil {
-			return nil, fmt.Errorf("job %s not found", id)
-		}
 	}
 
 	// 5. Return the `result` slice and nil error.
 	return result, nil
-
 }
