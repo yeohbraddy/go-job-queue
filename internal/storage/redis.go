@@ -167,18 +167,45 @@ func (s *RedisStorage) UpdateJob(ctx context.Context, j *job.Job) error {
 // DeleteJob deletes a job from Redis
 func (s *RedisStorage) DeleteJob(ctx context.Context, id string) error {
 	// 1. Get the current job using `s.GetJob(ctx, id)` to know its status.
-	// 2. Handle errors. If the job is not found (`currentJob == nil`), it's already gone, so return `nil`.
-	// 3. Start a Redis pipeline: `pipe := s.client.Pipeline()`.
-	// 4. Generate the status set key using `s.jobsSetFunc(currentJob.Status)`.
-	// 5. Use `pipe.SRem` to remove the `id` from the status set.
-	// 6. Use `pipe.ZRem` to remove the `id` from the main sorted set `s.jobsKey`.
-	// 7. Generate the job key using `s.jobKeyFunc(id)`.
-	// 8. Use `pipe.Del` to delete the job data itself.
-	// 9. Execute the pipeline: `pipe.Exec(ctx)`. Handle errors.
-	// 10. Return nil on success.
+	currentJob, err := s.GetJob(ctx, id)
+	if err != nil {
+		if err == redis.Nil {
+			return nil
+		}
+		return fmt.Errorf("failed to get job: %w", err)
+	}
 
-	// --- Your implementation here ---
-	return fmt.Errorf("DeleteJob not implemented")
+	// 2. Handle errors. If the job is not found (`currentJob == nil`), it's already gone, so return `nil`.
+	if currentJob == nil {
+		return nil
+	}
+
+	// 3. Start a Redis pipeline: `pipe := s.client.Pipeline()`.
+	pipe := s.client.Pipeline()
+
+	// 4. Generate the status set key using `s.jobsSetFunc(currentJob.Status)`.
+	jobStatusSetKey := s.jobsSetFunc(currentJob.Status)
+
+	// 5. Use `pipe.SRem` to remove the `id` from the status set.
+	pipe.SRem(ctx, jobStatusSetKey, id)
+
+	// 6. Use `pipe.ZRem` to remove the `id` from the main sorted set `s.jobsKey`.
+	pipe.ZRem(ctx, s.jobsKey, id)
+
+	// 7. Generate the job key using `s.jobKeyFunc(id)`.
+	jobKey := s.jobKeyFunc(id)
+
+	// 8. Use `pipe.Del` to delete the job data itself.
+	pipe.Del(ctx, jobKey)
+
+	// 9. Execute the pipeline: `pipe.Exec(ctx)`. Handle errors.
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to delete job: %w", err)
+	}
+
+	// 10. Return nil on success.
+	return nil
 }
 
 // ListJobs retrieves a list of jobs with optional filters
