@@ -76,17 +76,32 @@ func (s *RedisStorage) SaveJob(ctx context.Context, j *job.Job) error {
 // GetJob retrieves a job from Redis by ID
 func (s *RedisStorage) GetJob(ctx context.Context, id string) (*job.Job, error) {
 	// 1. Generate the job key using `s.jobKeyFunc(id)`.
+	jobKey := s.jobKeyFunc(id)
+
 	// 2. Use `s.client.Get` to retrieve the data associated with the job key.
+	jobBytes, err := s.client.Get(ctx, jobKey).Bytes()
+
 	// 3. Handle errors:
 	//    - If the error is `redis.Nil`, the job wasn't found. Return `nil, nil`.
 	//    - For other errors, return `nil, fmt.Errorf(...)`.
-	// 4. Use `Bytes()` on the result of `Get` to get the JSON bytes. Handle errors.
-	// 5. Create a variable of type `job.Job`.
-	// 6. Unmarshal the JSON bytes into the job variable. Handle errors (`fmt.Errorf`).
-	// 7. Return the pointer to the job variable (`&j`) and nil error on success.
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get job: %w", err)
+	}
 
-	// --- Your implementation here ---
-	return nil, fmt.Errorf("GetJob not implemented")
+	// 4. Create a variable of type `job.Job`.
+	var j job.Job
+
+	// 5. Unmarshal the JSON bytes into the job variable. Handle errors (`fmt.Errorf`).
+	err = json.Unmarshal(jobBytes, &j)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal job: %w", err)
+	}
+
+	// 6. Return the pointer to the job variable (`&j`) and nil error on success.
+	return &j, nil
 }
 
 // UpdateJob updates a job in Redis
