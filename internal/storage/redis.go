@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/yeohbraddy/go-job-queue/internal/job"
@@ -107,22 +108,60 @@ func (s *RedisStorage) GetJob(ctx context.Context, id string) (*job.Job, error) 
 // UpdateJob updates a job in Redis
 func (s *RedisStorage) UpdateJob(ctx context.Context, j *job.Job) error {
 	// 1. Get the current state of the job using `s.GetJob(ctx, j.ID)`. Handle errors (including not found).
+	currentJob, err := s.GetJob(ctx, j.ID)
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil
+		}
+		return fmt.Errorf("failed to get job: %w", err)
+	}
+
 	// 2. Check if the status has changed (`currentJob.Status != j.Status`).
 	// 3. If status changed:
-	//    a. Start a Redis pipeline: `pipe := s.client.Pipeline()`.
-	//    b. Generate the old status set key using `s.jobsSetFunc(currentJob.Status)`.
-	//    c. Use `pipe.SRem` to remove `j.ID` from the old status set.
-	//    d. Generate the new status set key using `s.jobsSetFunc(j.Status)`.
-	//    e. Use `pipe.SAdd` to add `j.ID` to the new status set.
-	//    f. Execute the pipeline: `pipe.Exec(ctx)`. Handle errors.
-	// 4. Update the job's `UpdatedAt` timestamp: `j.UpdatedAt = time.Now()`.
-	// 5. Marshal the updated job `j` into JSON bytes. Handle errors.
-	// 6. Generate the job key using `s.jobKeyFunc(j.ID)`.
-	// 7. Use `s.client.Set` to store the updated JSON bytes under the job key (overwrite). Handle errors.
-	// 8. Return nil on success.
+	if currentJob.Status != j.Status {
+		// 3. Start a Redis pipeline: `pipe := s.client.Pipeline()`.
+		pipe := s.client.Pipeline()
 
-	// --- Your implementation here ---
-	return fmt.Errorf("UpdateJob not implemented")
+		// 4. Generate the old status set key using `s.jobsSetFunc(currentJob.Status)`.
+		oldStatusSetKey := s.jobsSetFunc(currentJob.Status)
+
+		// 5. Use `pipe.SRem` to remove `j.ID` from the old status set.
+		pipe.SRem(ctx, oldStatusSetKey, j.ID)
+
+		// 6. Generate the new status set key using `s.jobsSetFunc(j.Status)`.
+		newStatusSetKey := s.jobsSetFunc(j.Status)
+
+		// 7. Use `pipe.SAdd` to add `j.ID` to the new status set.
+		pipe.SAdd(ctx, newStatusSetKey, j.ID)
+
+		// 8. Execute the pipeline: `pipe.Exec(ctx)`. Handle errors.
+		_, err = pipe.Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to update job status: %w", err)
+		}
+	}
+
+	// 4. Update the job's `UpdatedAt` timestamp: `j.UpdatedAt = time.Now()`.
+	j.UpdatedAt = time.Now()
+
+	// 5. Marshal the updated job `j` into JSON bytes. Handle errors.
+	jsonBytes, err := json.Marshal(j)
+	if err != nil {
+		return fmt.Errorf("failed to marshal job: %w", err)
+	}
+
+	// 6. Generate the job key using `s.jobKeyFunc(j.ID)`.
+	jobKey := s.jobKeyFunc(j.ID)
+
+	// 7. Use `s.client.Set` to store the updated JSON bytes under the job key (overwrite). Handle errors.
+	err = s.client.Set(ctx, jobKey, jsonBytes, 0).Err()
+	if err != nil {
+		return fmt.Errorf("failed to update job: %w", err)
+	}
+
+	// 8. Return nil on success.
+	return nil
+
 }
 
 // DeleteJob deletes a job from Redis
